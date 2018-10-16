@@ -16,7 +16,14 @@ func pullGit(dir string) bool {
 	cmd := exec.Command("git", "pull")
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
-	cmd.Run()
+	_ = cmd.Run()
+	if _, err := os.Stat(path.Join(dir, ".gitmodules")); !os.IsNotExist(err) {
+		log.Println("Submodule ", dir)
+		cmd := exec.Command("git", "submodule", "update", "--remote")
+		cmd.Dir = dir
+		cmd.Stdout = os.Stdout
+		_ = cmd.Run()
+	}
 	return true
 }
 
