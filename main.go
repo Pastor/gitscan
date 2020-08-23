@@ -12,8 +12,13 @@ import (
 type DoDirectory func(string) bool
 
 func pullGit(dir string) bool {
+	log.Println("Fetch ", dir)
+	cmd := exec.Command("git", "fetch", "--all", "--tags")
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	_ = cmd.Run()
 	log.Println("Pull ", dir)
-	cmd := exec.Command("git", "pull")
+	cmd = exec.Command("git", "pull", "--all")
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	_ = cmd.Run()
