@@ -2,11 +2,11 @@ package main
 
 import (
 	"flag"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 )
 
 type DoDirectory func(string) bool
@@ -33,14 +33,14 @@ func pullGit(dir string) bool {
 }
 
 func findGit(dir string, cb DoDirectory) {
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for _, f := range files {
 		absFileName := path.Join(dir, f.Name())
-		if f.IsDir() {
+		if f.IsDir() && !strings.HasPrefix(f.Name(), "__") {
 			if f.Name() == ".git" {
 				cb(dir)
 				return
