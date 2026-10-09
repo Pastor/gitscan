@@ -1,9 +1,10 @@
-// pastor-sync — полная синхронизация репозиториев GitHub-аккаунта с локальной папкой
+// pastor-sync — полная синхронизация репозиториев GitHub и GitLab с локальной папкой
 // и ведение реестра репозиториев.
 //
 // Основан на https://github.com/Pastor/gitscan (рекурсивный обход .git-каталогов
 // и обновление их через git fetch/pull/submodule), расширен до:
-//   - получения списка репозиториев через GitHub API (включая приватные, по токену);
+//   - нескольких источников: github.com и любое число инстансов GitLab (gitscan.json);
+//   - получения списка репозиториев через API (включая приватные, по токену);
 //   - клонирования отсутствующих репозиториев;
 //   - полной синхронизации: все ветки, все теги, все подмодули;
 //   - генерации реестра registry.json / REGISTRY.md / registry.csv.
@@ -21,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "1.1.0"
+const version = "2.0.0"
 
 // toolName — имя, под которым инструмент запущен. Один и тот же исходник
 // собирается и как gitscan, и как pastor-sync; в подсказках показываем то,
@@ -38,27 +39,29 @@ func execName() string {
 
 // Config — параметры запуска.
 type Config struct {
-	Root       string // корневая папка (реестр, бинарник, служебные каталоги)
-	ReposDir   string // подпапка с репозиториями, относительно Root
-	User       string // владелец репозиториев на GitHub
-	Token      string // токен GitHub (для приватных репозиториев и лимитов API)
-	Jobs       int    // число параллельных потоков
-	Forks      bool   // включать форки
-	Member     bool   // включать репозитории, где пользователь участник, а не владелец
-	Archived   bool   // включать архивные репозитории
-	Submodules bool   // выкачивать подмодули
-	ForkSync   bool   // подтягивать в форки изменения из upstream
-	ForkPush   bool   // обновлять форк и на GitHub (нужен токен)
-	ForkTags   bool   // забирать в форк ещё и теги upstream
-	SSH        bool   // клонировать по ssh вместо https
-	DryRun     bool   // ничего не менять, только показать план
-	Only       string // фильтр по подстроке в имени репозитория
-	EnvFile    string // путь к .env, откуда брать токен
-	TokenFrom  string // откуда фактически взят токен (для лога)
-	NoRegistry bool   // не генерировать реестр после синхронизации
-	Timeout    time.Duration
-	Verbose    bool
-	Budget     time.Duration // ограничение времени на пересборку описаний реестра
+	Root         string // корневая папка (реестр, бинарник, служебные каталоги)
+	ReposDir     string // подпапка с репозиториями, относительно Root
+	User         string // владелец репозиториев на GitHub (основной GitHub-источник)
+	Token        string // токен GitHub из флага -token (основной GitHub-источник)
+	ConfigFile   string // файл источников, по умолчанию <Root>/gitscan.json
+	SourceFilter string // работать только с этими источниками (через запятую)
+	Sources      []*Source
+	Jobs         int    // число параллельных потоков
+	Forks        bool   // включать форки
+	Member       bool   // включать репозитории, где пользователь участник, а не владелец
+	Archived     bool   // включать архивные репозитории
+	Submodules   bool   // выкачивать подмодули
+	ForkSync     bool   // подтягивать в форки изменения из upstream
+	ForkPush     bool   // обновлять форк и на GitHub (нужен токен)
+	ForkTags     bool   // забирать в форк ещё и теги upstream
+	SSH          bool   // клонировать по ssh вместо https
+	DryRun       bool   // ничего не менять, только показать план
+	Only         string // фильтр по подстроке в имени репозитория
+	EnvFile      string // путь к .env, откуда брать токен
+	NoRegistry   bool   // не генерировать реестр после синхронизации
+	Timeout      time.Duration
+	Verbose      bool
+	Budget       time.Duration // ограничение времени на пересборку описаний реестра
 }
 
 // Служебные каталоги. Каталоги, начинающиеся с точки или с "__",
@@ -84,19 +87,24 @@ func (c *Config) Repos() string {
 func (c *Config) Broken() string { return filepath.Join(c.Root, brokenDirName) }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `%s %s — синхронизация репозиториев GitHub с локальной папкой
+	fmt.Fprintf(os.Stderr, `%s %s — синхронизация репозиториев GitHub и GitLab с локальной папкой
 
 Использование:
   %[1]s [команда] [флаги]
 
 Команды:
-  sync       (по умолчанию) получить список репозиториев с GitHub, склонировать новые,
-             обновить существующие (все ветки, теги, подмодули) и пересобрать реестр
+  sync       (по умолчанию) получить списки репозиториев всех источников, склонировать
+             новые, обновить существующие (все ветки, теги, подмодули) и пересобрать реестр
   scan       режим gitscan: обновить все git-репозитории, найденные в папке,
-             без обращения к GitHub API
+             без обращения к API
   registry   только пересобрать реестр по локальному состоянию
-  token      показать, откуда взят токен GitHub, и проверить его
-  list       показать список репозиториев на GitHub, ничего не меняя
+  token      показать, откуда взяты токены источников, и проверить их
+  list       показать списки репозиториев на серверах, ничего не меняя
+  sources    показать настроенные источники
+  source add -name work -url https://git.company.ru -token glpat-...
+             добавить источник GitLab (флаги: %[1]s source add -h)
+  source remove work
+             убрать источник из конфига (локальные копии остаются)
   version    версия
 
 Флаги:
@@ -104,29 +112,33 @@ func usage() {
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, `
 Структура папки:
-  <папка>/repositories/<репозиторий>/   сами репозитории
+  <папка>/gitscan.json                  источники (без файла — только GitHub)
+  <папка>/repositories/<источник>/<путь>/   сами репозитории
   <папка>/REGISTRY.md, registry.json, registry.csv, registry-branches.csv
   <папка>/%s/                       исходники, сборки, кэш API, логи
   <папка>/%s/                     карантин повреждённых копий
 
-Токен GitHub ищется в таком порядке:
+Токен основного GitHub-источника ищется в таком порядке:
   1. флаг -token
   2. переменные окружения GITHUB_TOKEN, GH_TOKEN, GITHUB_PAT, GH_PAT,
      GITHUB_ACCESS_TOKEN, PASTOR_SYNC_TOKEN
   3. файлы .env: путь из -env, затем <папка>/.env, <папка>/%s/.env,
      ./.env, ~/.env, ~/.config/pastor-sync/.env
   4. файлы с «голым» токеном: <папка>/%s/token, ~/.github_token
+Токен GitLab-источника: token_env / token_file из конфига, <папка>/%s/tokens/<имя>,
+переменная GITLAB_TOKEN_<ИМЯ> в окружении или .env.
 Проверить, что нашлось: %[1]s token
-Без токена доступны только публичные репозитории.
+Без токена доступны только публичные репозитории GitHub.
 
 Примеры:
   %[1]s                       # полная синхронизация в текущей папке
   %[1]s -jobs 8               # в 8 потоков
-  %[1]s -only stm8            # только репозитории с "stm8" в имени
+  %[1]s -only stm8            # только репозитории с "stm8" в пути
+  %[1]s -source work          # только источник work
   %[1]s -forks=false          # пропустить форки
   %[1]s registry              # пересобрать только реестр
   %[1]s scan                  # обновить всё, что лежит в папке, без API
-`, toolName, syncDirName, brokenDirName, syncDirName, syncDirName)
+`, toolName, syncDirName, brokenDirName, syncDirName, syncDirName, syncDirName)
 }
 
 func main() {
@@ -139,6 +151,10 @@ func main() {
 		command = args[0]
 		args = args[1:]
 	}
+	if command == "source" {
+		cmdSource(args, cwd)
+		return
+	}
 
 	fs := flag.NewFlagSet(toolName, flag.ExitOnError)
 	fs.Usage = usage
@@ -150,6 +166,8 @@ func main() {
 	fs.StringVar(&cfg.User, "user", envOr("GITHUB_USER", "Pastor"), "владелец репозиториев на GitHub")
 	fs.StringVar(&cfg.Token, "token", "", "токен GitHub (иначе берётся из окружения, .env или файла)")
 	fs.StringVar(&cfg.EnvFile, "env", "", "путь к .env, откуда взять токен")
+	fs.StringVar(&cfg.ConfigFile, "config", "", "файл источников (по умолчанию <папка>/"+configName+")")
+	fs.StringVar(&cfg.SourceFilter, "source", "", "работать только с этими источниками (через запятую)")
 	fs.IntVar(&cfg.Jobs, "jobs", defaultJobs(), "число параллельных потоков")
 	fs.BoolVar(&cfg.Forks, "forks", true, "включать форки")
 	fs.BoolVar(&cfg.Member, "member", true, "включать репозитории других владельцев, где пользователь участник")
@@ -160,7 +178,7 @@ func main() {
 	fs.BoolVar(&cfg.ForkTags, "fork-tags", false, "забирать в форк также теги upstream")
 	fs.BoolVar(&cfg.SSH, "ssh", false, "клонировать по ssh вместо https")
 	fs.BoolVar(&cfg.DryRun, "dry-run", false, "ничего не менять, только показать план")
-	fs.StringVar(&cfg.Only, "only", "", "обрабатывать только репозитории с этой подстрокой в имени")
+	fs.StringVar(&cfg.Only, "only", "", "обрабатывать только репозитории с этой подстрокой в пути <источник>/<путь>")
 	fs.BoolVar(&cfg.NoRegistry, "no-registry", false, "не пересобирать реестр после синхронизации")
 	fs.DurationVar(&cfg.Timeout, "timeout", 60*time.Minute, "таймаут на одну git-операцию")
 	fs.BoolVar(&cfg.Verbose, "v", false, "подробный вывод git")
@@ -181,8 +199,6 @@ func main() {
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 
-	src := FindToken(cfg)
-	cfg.Token, cfg.TokenFrom = src.Value, src.Where
 	if !explicit["user"] && os.Getenv("GITHUB_USER") == "" {
 		if u := FindUser(cfg); u != "" {
 			cfg.User = u
@@ -191,6 +207,10 @@ func main() {
 
 	closeLog := setupLog(cfg)
 	defer closeLog()
+
+	if err := loadSources(cfg, explicit); err != nil {
+		fatal("%v", err)
+	}
 
 	switch command {
 	case "version":
@@ -205,6 +225,8 @@ func main() {
 		cmdRegistry(cfg)
 	case "token":
 		cmdToken(cfg)
+	case "sources":
+		cmdSources(cfg)
 	case "help", "-h", "--help":
 		usage()
 	default:

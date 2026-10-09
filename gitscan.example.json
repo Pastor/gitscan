@@ -1,0 +1,32 @@
+{
+  "sources": [
+    {
+      "name": "github",
+      "type": "github",
+      "user": "Pastor"
+    },
+    {
+      "name": "work",
+      "type": "gitlab",
+      "url": "https://git.company.ru",
+      "token_env": "WORK_GITLAB_TOKEN",
+      "jobs": 4
+    },
+    {
+      "name": "lab",
+      "type": "gitlab",
+      "url": "https://lab.example.org/gitlab",
+      "groups": ["platform", "infra/tools"],
+      "ca_file": "~/certs/lab-ca.pem",
+      "ssh": true
+    },
+    {
+      "name": "gitlab-com",
+      "type": "gitlab",
+      "url": "https://gitlab.com",
+      "scope": "owned",
+      "token_file": "~/.config/gitscan/gitlab-com.token",
+      "disabled": true
+    }
+  ]
+}
