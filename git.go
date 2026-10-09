@@ -12,19 +12,29 @@ import (
 	"time"
 )
 
-// git выполняет команду git в каталоге dir и возвращает stdout.
+// git выполняет локальную команду git в каталоге dir и возвращает stdout.
 func git(cfg *Config, dir string, args ...string) (string, error) {
+	return runGit(cfg, nil, dir, args...)
+}
+
+// gitNet — для сетевых операций (clone, fetch, push, submodule update):
+// подставляет токен и TLS-настройки источника.
+func gitNet(cfg *Config, s *Source, dir string, args ...string) (string, error) {
+	return runGit(cfg, s, dir, args...)
+}
+
+func runGit(cfg *Config, s *Source, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", append(s.gitArgs(), args...)...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	cmd.Env = gitEnv(cfg)
+	cmd.Env = gitEnv(s)
 
 	err := cmd.Run()
 	if err != nil {
@@ -62,34 +72,58 @@ func gitLines(cfg *Config, dir string, args ...string) ([]string, error) {
 var askPassPath string
 
 // gitEnv готовит окружение: отключает интерактивные запросы пароля и,
-// если задан токен, подставляет его через GIT_ASKPASS (токен не попадает
-// ни в командную строку, ни в .git/config).
-func gitEnv(cfg *Config) []string {
+// если у источника есть токен, подставляет его через GIT_ASKPASS (токен не
+// попадает ни в командную строку, ни в .git/config).
+func gitEnv(s *Source) []string {
 	env := append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_LFS_SKIP_SMUDGE=0",
 		"LC_ALL=C",
 	)
-	if cfg.Token != "" && askPassPath != "" {
+	if s != nil && s.Token != "" && askPassPath != "" {
 		env = append(env,
 			"GIT_ASKPASS="+askPassPath,
-			"PASTOR_SYNC_TOKEN="+cfg.Token,
+			"GITSCAN_GIT_USER="+s.provider().GitUser(),
+			"GITSCAN_GIT_TOKEN="+s.Token,
+			"GITSCAN_GIT_HOSTS="+strings.Join(s.hosts, " "),
 		)
 	}
 	return env
 }
 
-// setupAskPass создаёт временный helper для передачи токена git-у.
+// askPassScript отдаёт токен, только если git спрашивает про хост своего
+// источника: токен GitHub не уйдёт на GitLab, а токен GitLab — на хост
+// чужого подмодуля. Для чужого хоста ответ пустой, и git просто не войдёт.
+const askPassScript = `#!/bin/sh
+ok=
+for h in $GITSCAN_GIT_HOSTS; do
+  case "$1" in
+    *"://$h'"*|*"://$h:"*|*"://$h/"*|*"@$h'"*|*"@$h:"*|*"@$h/"*) ok=1 ;;
+  esac
+done
+[ -n "$ok" ] || exit 0
+case "$1" in
+  Username*) printf '%s\n' "$GITSCAN_GIT_USER" ;;
+  *) printf '%s\n' "$GITSCAN_GIT_TOKEN" ;;
+esac
+`
+
+// setupAskPass создаёт временный helper для передачи токенов git-у.
 func setupAskPass(cfg *Config) func() {
-	if cfg.Token == "" || runtime.GOOS == "windows" {
+	need := false
+	for _, s := range cfg.Sources {
+		if s.Token != "" {
+			need = true
+		}
+	}
+	if !need || runtime.GOOS == "windows" {
 		return func() {}
 	}
-	f, err := os.CreateTemp("", "pastor-askpass-*.sh")
+	f, err := os.CreateTemp("", "gitscan-askpass-*.sh")
 	if err != nil {
 		return func() {}
 	}
-	script := "#!/bin/sh\ncase \"$1\" in\n  Username*) echo \"x-access-token\" ;;\n  *) echo \"$PASTOR_SYNC_TOKEN\" ;;\nesac\n"
-	if _, err := f.WriteString(script); err != nil {
+	if _, err := f.WriteString(askPassScript); err != nil {
 		_ = f.Close()
 		_ = os.Remove(f.Name())
 		return func() {}

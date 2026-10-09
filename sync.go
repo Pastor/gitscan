@@ -20,106 +20,61 @@ type Result struct {
 	Duration time.Duration
 }
 
-// cmdToken показывает, откуда взят токен, и проверяет его на GitHub.
+// cmdToken показывает, откуда взяты токены источников, и проверяет их.
 func cmdToken(cfg *Config) {
-	fmt.Println("Где искался токен:")
-	for i, k := range tokenKeys {
-		mark := "—"
-		if os.Getenv(k) != "" {
-			mark = "есть"
+	for i, s := range cfg.Active() {
+		if i > 0 {
+			fmt.Println()
 		}
-		fmt.Printf("  %d. переменная окружения %-22s %s\n", i+1, k, mark)
-	}
-	for _, p := range envFileCandidates(cfg) {
-		state := "нет файла"
-		if vars, err := parseDotenv(p); err == nil {
-			state = "есть файл, токена в нём нет"
-			for _, k := range tokenKeys {
-				if strings.TrimSpace(vars[k]) != "" {
-					state = "токен найден (" + k + ")"
-					break
-				}
-			}
-		}
-		fmt.Printf("     .env %-52s %s\n", p, state)
-	}
-
-	if cfg.Token == "" {
-		fmt.Println("\nТокен не найден — доступны только публичные репозитории,")
-		fmt.Println("лимит GitHub API 60 запросов в час, форки на GitHub обновляться не будут.")
-		fmt.Printf("Проще всего: создайте файл %s со строкой\n  GITHUB_TOKEN=ghp_...\n",
-			filepath.Join(cfg.Root, ".env"))
-		return
-	}
-
-	fmt.Printf("\nИспользуется: %s\n", maskToken(cfg.Token))
-	fmt.Printf("Источник:     %s\n", cfg.TokenFrom)
-
-	var who struct {
-		Login string `json:"login"`
-		Name  string `json:"name"`
-	}
-	resp, err := apiGet(cfg, apiBase+"/user", &who)
-	if err != nil {
-		fmt.Printf("Проверка:     НЕ ПРОШЛА — %v\n", err)
-		return
-	}
-	fmt.Printf("Проверка:     ок, GitHub видит вас как %s", who.Login)
-	if who.Name != "" {
-		fmt.Printf(" (%s)", who.Name)
-	}
-	fmt.Println()
-	if sc := resp.Header.Get("X-OAuth-Scopes"); sc != "" {
-		fmt.Printf("Права:        %s\n", sc)
-		if !strings.Contains(sc, "repo") {
-			fmt.Println("              ⚠ для приватных репозиториев и обновления форков нужен доступ repo")
-		}
-	} else {
-		fmt.Println("Права:        fine-grained токен (проверьте: Contents — Read and write)")
-	}
-	if lim := resp.Header.Get("X-RateLimit-Limit"); lim != "" {
-		fmt.Printf("Лимит API:    %s из %s запросов осталось\n",
-			resp.Header.Get("X-RateLimit-Remaining"), lim)
-	}
-	if !strings.EqualFold(who.Login, cfg.User) {
-		fmt.Printf("\n⚠ Токен принадлежит %s, а синхронизируется аккаунт %s.\n", who.Login, cfg.User)
-		fmt.Printf("  Если это не нарочно — укажите -user %s\n", who.Login)
+		fmt.Printf("=== %s — %s, %s ===\n", s.Name, s.kindTitle(), s.webBase())
+		s.provider().Check(cfg)
 	}
 }
 
-// cmdList печатает список репозиториев на GitHub.
+// cmdList печатает списки репозиториев источников, ничего не меняя.
 func cmdList(cfg *Config) {
-	repos, err := FetchRepos(cfg)
-	if err != nil {
-		fatal("%v", err)
-	}
-	repos = Filter(cfg, repos)
-	own, forks, member, priv := 0, 0, 0, 0
-	for _, r := range repos {
-		kind := "свой"
-		switch {
-		case !strings.EqualFold(r.Owner.Login, cfg.User):
-			kind = "участник"
-			member++
-		case r.Fork:
-			kind = "форк"
-			forks++
-		default:
-			own++
+	total := 0
+	for _, s := range cfg.Active() {
+		repos, err := s.provider().List(cfg)
+		if err != nil {
+			log.Printf("ОШИБКА: %v", err)
+			continue
 		}
-		vis := "public"
-		if r.Private {
-			vis = "private"
-			priv++
+		repos = Filter(cfg, repos)
+		fmt.Printf("\n=== %s — %s, %s ===\n", s.Name, s.kindTitle(), s.Display())
+		own, forks, member, priv := 0, 0, 0, 0
+		for _, r := range repos {
+			kind := "свой"
+			switch {
+			case r.Fork:
+				kind = "форк"
+				forks++
+			case !r.Mine:
+				kind = "участник"
+				member++
+			default:
+				own++
+			}
+			if r.Private {
+				priv++
+			}
+			size := ""
+			if r.Size > 0 {
+				size = humanSize(r.Size)
+			}
+			fmt.Printf("%-50s %-9s %-8s %-10s %9s  %s\n",
+				r.Path, kind, r.Visibility, r.DefaultBranch, size, oneLine(r.Description, 60))
 		}
-		fmt.Printf("%-40s %-9s %-8s %-10s %9s  %s\n",
-			r.Name, kind, vis, r.DefaultBranch, humanSize(r.Size*1024), oneLine(r.Description, 60))
+		fmt.Printf("Всего в %s: %d (своих %d, форков %d, чужих/групповых %d, закрытых %d)\n",
+			s.Name, len(repos), own, forks, member, priv)
+		total += len(repos)
 	}
-	fmt.Printf("\nВсего: %d (своих %d, форков %d, чужих с участием %d, приватных %d)\n",
-		len(repos), own, forks, member, priv)
+	if len(cfg.Active()) > 1 {
+		fmt.Printf("\nВсего по источникам: %d\n", total)
+	}
 }
 
-// cmdSync — основная команда: список с GitHub, клонирование новых, обновление старых.
+// cmdSync — основная команда: списки источников, клонирование новых, обновление старых.
 func cmdSync(cfg *Config) {
 	start := time.Now()
 	cleanup := setupAskPass(cfg)
@@ -129,32 +84,42 @@ func cmdSync(cfg *Config) {
 		fatal("не удалось создать %s: %v", cfg.Repos(), err)
 	}
 	migrateStrays(cfg)
+	migrateLayout(cfg)
+	log.Printf("Синхронизация -> %s, потоков: %d", cfg.Root, cfg.Jobs)
 
-	auth := "без токена (только публичные репозитории)"
-	if cfg.Token != "" {
-		auth = "с токеном из " + cfg.TokenFrom
+	listed := map[string][]Repo{} // источники, чей список удалось получить
+	var queues [][]Repo
+	for _, s := range cfg.Active() {
+		auth := "без токена"
+		if s.Token != "" {
+			auth = "токен из " + s.TokenFrom
+		}
+		log.Printf("Источник %s (%s): %s, %s", s.Name, s.kindTitle(), s.webBase(), auth)
+		repos, err := s.provider().List(cfg)
+		if err != nil {
+			log.Printf("ОШИБКА: %v — источник пропущен", err)
+			continue
+		}
+		saveRepoCache(cfg, s, repos)
+		applyMoves(cfg, s, repos)
+		listed[s.Name] = repos
+		todo := Filter(cfg, repos)
+		log.Printf("  %s: получено репозиториев %d, к обработке %d", s.Name, len(repos), len(todo))
+		queues = append(queues, todo)
 	}
-	log.Printf("Синхронизация %s -> %s, %s, потоков: %d", cfg.User, cfg.Root, auth, cfg.Jobs)
-
-	repos, err := FetchRepos(cfg)
-	if err != nil {
-		fatal("%v", err)
+	if len(listed) == 0 {
+		fatal("ни один источник не ответил")
 	}
-	repos = DedupeByDir(cfg, repos)
-	repos = EnrichForks(cfg, repos)
-	saveRepoCache(cfg, repos)
-	all := repos
-	repos = Filter(cfg, repos)
-	log.Printf("Получено репозиториев: %d, к обработке: %d", len(all), len(repos))
+	repos := interleave(queues)
 
 	if cfg.DryRun {
+		sortRepos(repos)
 		for _, r := range repos {
-			dir := filepath.Join(cfg.Repos(), r.Name)
 			state := "обновить"
-			if !isGitRepo(dir) {
+			if !isGitRepo(cfg.RepoDir(r)) {
 				state = "склонировать"
 			}
-			log.Printf("[план] %-12s %s", state, r.Name)
+			log.Printf("[план] %-12s %s", state, r.Key())
 		}
 		log.Printf("Пробный запуск, изменений не внесено")
 		return
@@ -164,7 +129,7 @@ func cmdSync(cfg *Config) {
 		return syncRepo(cfg, r)
 	})
 
-	reportOrphans(cfg, all)
+	reportOrphans(cfg, listed)
 	summarize(results, start)
 
 	if !cfg.NoRegistry {
@@ -175,36 +140,38 @@ func cmdSync(cfg *Config) {
 	}
 }
 
-// cmdScan — режим gitscan: обновить всё, что уже лежит в папке, без GitHub API.
+// cmdScan — режим gitscan: обновить всё, что уже лежит в папке, без API.
 func cmdScan(cfg *Config) {
 	start := time.Now()
 	cleanup := setupAskPass(cfg)
 	defer cleanup()
 
 	migrateStrays(cfg)
+	migrateLayout(cfg)
 	dirs := findGitDirs(cfg.Repos())
 	log.Printf("Найдено git-репозиториев: %d в %s", len(dirs), cfg.Repos())
 
-	cache := map[string]Repo{}
-	for _, r := range loadRepoCache(cfg) {
-		cache[strings.ToLower(r.Name)] = r
+	known := map[string]Repo{}
+	for _, s := range cfg.Sources {
+		for _, r := range loadRepoCache(cfg, s) {
+			known[strings.ToLower(r.Key())] = r
+		}
 	}
 
 	var repos []Repo
 	for _, d := range dirs {
-		name := filepath.Base(d)
-		if cfg.Only != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(cfg.Only)) {
+		r := repoAt(cfg, d, known)
+		if cfg.Only != "" && !strings.Contains(strings.ToLower(r.Key()), strings.ToLower(cfg.Only)) {
 			continue
 		}
-		if r, ok := cache[strings.ToLower(name)]; ok {
-			repos = append(repos, r)
+		if !cfg.sourceAllowed(r.Source) {
 			continue
 		}
-		repos = append(repos, Repo{Name: name})
+		repos = append(repos, r)
 	}
 
 	results := runParallel(cfg, repos, func(r Repo) Result {
-		return updateRepo(cfg, r, filepath.Join(cfg.Repos(), r.Name))
+		return updateRepo(cfg, r, cfg.RepoDir(r))
 	})
 	summarize(results, start)
 
@@ -215,13 +182,34 @@ func cmdScan(cfg *Config) {
 	}
 }
 
+// repoAt описывает найденный на диске каталог: по кэшу источника, а если его
+// там нет — по пути <источник>/<путь>.
+func repoAt(cfg *Config, dir string, known map[string]Repo) Repo {
+	rel, err := filepath.Rel(cfg.Repos(), dir)
+	if err != nil {
+		rel = filepath.Base(dir)
+	}
+	rel = filepath.ToSlash(rel)
+	if r, ok := known[strings.ToLower(rel)]; ok {
+		return r
+	}
+	r := Repo{Path: rel, Name: filepath.Base(dir)}
+	if i := strings.Index(rel, "/"); i > 0 {
+		if s := cfg.source(rel[:i]); s != nil {
+			r.Source, r.Path, r.src = s.Name, rel[i+1:], s
+		}
+	}
+	return r
+}
+
 func cmdRegistry(cfg *Config) {
 	if err := BuildRegistry(cfg); err != nil {
 		fatal("%v", err)
 	}
 }
 
-// runParallel обрабатывает репозитории пулом воркеров.
+// runParallel обрабатывает репозитории пулом воркеров. Если у источника
+// задан предел jobs, с его сервером одновременно работает не больше jobs потоков.
 func runParallel(cfg *Config, repos []Repo, fn func(Repo) Result) []Result {
 	jobs := make(chan Repo)
 	results := make([]Result, 0, len(repos))
@@ -235,7 +223,13 @@ func runParallel(cfg *Config, repos []Repo, fn func(Repo) Result) []Result {
 		go func() {
 			defer wg.Done()
 			for r := range jobs {
-				res := fn(r)
+				res := func() Result {
+					if r.src != nil && r.src.sem != nil {
+						r.src.sem <- struct{}{}
+						defer func() { <-r.src.sem }()
+					}
+					return fn(r)
+				}()
 				mu.Lock()
 				done++
 				n := done
@@ -245,7 +239,7 @@ func runParallel(cfg *Config, repos []Repo, fn func(Repo) Result) []Result {
 				if res.Err != nil {
 					status = "ОШИБКА"
 				}
-				log.Printf("[%d/%d] %-38s %-12s %s %s", n, total, res.Name, status,
+				log.Printf("[%d/%d] %-50s %-12s %s %s", n, total, res.Name, status,
 					humanDuration(res.Duration), res.Detail)
 				if res.Err != nil {
 					log.Printf("        %v", res.Err)
@@ -269,11 +263,11 @@ func runParallel(cfg *Config, repos []Repo, fn func(Repo) Result) []Result {
 // Повреждённую копию (обрыв клонирования, битый .git) уводит в карантин
 // и клонирует заново.
 func syncRepo(cfg *Config, r Repo) Result {
-	dir := filepath.Join(cfg.Repos(), r.Name)
+	dir := cfg.RepoDir(r)
 	if isGitRepo(dir) {
 		if healthy, why := repoHealthy(cfg, dir); !healthy {
-			if err := quarantine(cfg, dir); err != nil {
-				return Result{Name: r.Name, Action: "skipped",
+			if err := quarantine(cfg, dir, r.Key()); err != nil {
+				return Result{Name: r.Key(), Action: "skipped",
 					Detail: "повреждён (" + why + "), убрать не удалось", Err: err}
 			}
 			res := cloneRepo(cfg, r, dir)
@@ -286,8 +280,13 @@ func syncRepo(cfg *Config, r Repo) Result {
 	if st, err := os.Stat(dir); err == nil && st.IsDir() {
 		if empty, _ := isEmptyDir(dir); empty {
 			_ = os.Remove(dir)
+		} else if len(findGitDirs(dir)) > 0 {
+			// в GitLab проект и группа могут называться одинаково:
+			// group/app и group/app/backend — второй уже лежит внутри
+			return Result{Name: r.Key(), Action: "skipped",
+				Detail: "в каталоге лежат другие репозитории (группа с тем же именем)"}
 		} else {
-			return Result{Name: r.Name, Action: "skipped",
+			return Result{Name: r.Key(), Action: "skipped",
 				Detail: "каталог существует, но это не git-репозиторий"}
 		}
 	}
@@ -319,11 +318,11 @@ func repoHealthy(cfg *Config, dir string) (bool, string) {
 }
 
 // quarantine переносит повреждённую копию в __broken (не удаляя данные).
-func quarantine(cfg *Config, dir string) error {
+func quarantine(cfg *Config, dir, key string) error {
 	if err := os.MkdirAll(cfg.Broken(), 0o755); err != nil {
 		return err
 	}
-	base := filepath.Base(dir) + "-" + time.Now().Format("20060102-150405")
+	base := strings.ReplaceAll(key, "/", "~") + "-" + time.Now().Format("20060102-150405")
 	dst := filepath.Join(cfg.Broken(), base)
 	for i := 1; ; i++ {
 		if _, err := os.Stat(dst); os.IsNotExist(err) {
@@ -383,23 +382,35 @@ func cloneRepo(cfg *Config, r Repo, dir string) Result {
 	start := time.Now()
 	// подмодули выкачиваем отдельным шагом: сбой одного из них не должен
 	// оставлять нас вообще без репозитория
+	if r.CloneURL == "" {
+		return Result{Name: r.Key(), Action: "skipped", Detail: "сервер не сообщил адрес для клонирования"}
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return Result{Name: r.Key(), Action: "failed", Err: err}
+	}
 	args := []string{"clone", "--origin", "origin", "--jobs", "4", r.URLFor(cfg), dir}
-	if _, err := git(cfg, cfg.Repos(), args...); err != nil {
-		return Result{Name: r.Name, Action: "failed", Err: err, Duration: time.Since(start)}
+	if _, err := gitNet(cfg, r.src, cfg.Repos(), args...); err != nil {
+		return Result{Name: r.Key(), Action: "failed", Err: err, Duration: time.Since(start)}
 	}
 	// подтянуть все теги и создать локальные ветки под каждую удалённую
-	_, _ = git(cfg, dir, "fetch", "origin", "--tags", "--prune", "--quiet")
+	_, _ = gitNet(cfg, r.src, dir, "fetch", "origin", "--tags", "--prune", "--quiet")
 	created := syncLocalBranches(cfg, dir)
 
 	detail := fmt.Sprintf("веток: %d, %s", created, humanSize(dirSize(dir)))
-	if note := updateSubmodules(cfg, dir); note != "" {
+	if r.Empty {
+		detail = "пустой репозиторий"
+	}
+	if r.PendingDelete {
+		detail += "; помечен на сервере к удалению"
+	}
+	if note := updateSubmodules(cfg, r.src, dir); note != "" {
 		detail += "; " + note
 	}
 	if note := describeFork(syncFork(cfg, r, dir)); note != "" {
 		detail += "; " + note
 	}
 	return Result{
-		Name:     r.Name,
+		Name:     r.Key(),
 		Action:   "cloned",
 		Detail:   detail,
 		Duration: time.Since(start),
@@ -412,7 +423,7 @@ func updateRepo(cfg *Config, r Repo, dir string) Result {
 	var notes []string
 
 	if !isGitRepo(dir) {
-		return Result{Name: r.Name, Action: "skipped", Detail: "нет .git", Duration: time.Since(start)}
+		return Result{Name: r.Key(), Action: "skipped", Detail: "нет .git", Duration: time.Since(start)}
 	}
 
 	// адрес origin приводим к актуальному (репозиторий мог быть переименован)
@@ -432,16 +443,14 @@ func updateRepo(cfg *Config, r Repo, dir string) Result {
 	// все ветки и все теги, с удалением исчезнувших на сервере
 	fetchArgs := []string{"fetch", "origin", "--prune", "--tags", "--quiet",
 		"+refs/heads/*:refs/remotes/origin/*"}
-	if _, err := git(cfg, dir, fetchArgs...); err != nil {
-		// --prune-tags поддерживается не везде; повторяем без него уже внутри fetchArgs,
-		// поэтому здесь ошибка означает реальную проблему связи/доступа
-		return Result{Name: r.Name, Action: "failed", Err: err, Duration: time.Since(start)}
+	if _, err := gitNet(cfg, r.src, dir, fetchArgs...); err != nil {
+		return Result{Name: r.Key(), Action: "failed", Err: err, Duration: time.Since(start)}
 	}
-	_, _ = git(cfg, dir, "remote", "set-head", "origin", "--auto")
+	_, _ = gitNet(cfg, r.src, dir, "remote", "set-head", "origin", "--auto")
 
 	// неполная (shallow) копия — дотягиваем историю целиком
 	if out, err := git(cfg, dir, "rev-parse", "--is-shallow-repository"); err == nil && out == "true" {
-		if _, err := git(cfg, dir, "fetch", "--unshallow", "--quiet", "origin"); err == nil {
+		if _, err := gitNet(cfg, r.src, dir, "fetch", "--unshallow", "--quiet", "origin"); err == nil {
 			notes = append(notes, "история дозагружена до полной")
 		}
 	}
@@ -474,8 +483,11 @@ func updateRepo(cfg *Config, r Repo, dir string) Result {
 		notes = append(notes, fmt.Sprintf("веток обновлено/создано: %d", updated))
 	}
 
-	if note := updateSubmodules(cfg, dir); note != "" {
+	if note := updateSubmodules(cfg, r.src, dir); note != "" {
 		notes = append(notes, note)
+	}
+	if r.PendingDelete {
+		notes = append(notes, "помечен на сервере к удалению")
 	}
 
 	after, _ := git(cfg, dir, "rev-parse", "--verify", "-q", "HEAD")
@@ -484,7 +496,7 @@ func updateRepo(cfg *Config, r Repo, dir string) Result {
 		action = "updated"
 	}
 	return Result{
-		Name:     r.Name,
+		Name:     r.Key(),
 		Action:   action,
 		Detail:   strings.Join(notes, "; "),
 		Duration: time.Since(start),
@@ -494,12 +506,12 @@ func updateRepo(cfg *Config, r Repo, dir string) Result {
 // updateSubmodules инициализирует и обновляет подмодули. Недоступный
 // подмодуль (сервер лежит, репозиторий переехал) не считается фатальным:
 // сам репозиторий уже выкачан и полезен.
-func updateSubmodules(cfg *Config, dir string) string {
+func updateSubmodules(cfg *Config, s *Source, dir string) string {
 	if !cfg.Submodules || !hasSubmodules(dir) {
 		return ""
 	}
 	_, _ = git(cfg, dir, "submodule", "sync", "--recursive")
-	if _, err := git(cfg, dir, "submodule", "update", "--init", "--recursive", "--jobs", "4"); err != nil {
+	if _, err := gitNet(cfg, s, dir, "submodule", "update", "--init", "--recursive", "--jobs", "4"); err != nil {
 		return "подмодули выкачаны не полностью: " + shortErr(err)
 	}
 	return "подмодули обновлены"
@@ -546,7 +558,7 @@ func findGitDirs(root string) []string {
 	var out []string
 	var walk func(dir string, depth int)
 	walk = func(dir string, depth int) {
-		if depth > 4 {
+		if depth > 12 {
 			return
 		}
 		entries, err := os.ReadDir(dir)
@@ -569,28 +581,42 @@ func findGitDirs(root string) []string {
 	return out
 }
 
-// reportOrphans сообщает о локальных каталогах, которых нет на GitHub.
-func reportOrphans(cfg *Config, repos []Repo) {
-	known := map[string]bool{}
-	for _, r := range repos {
-		known[strings.ToLower(r.Name)] = true
+// reportOrphans сообщает о локальных каталогах, которых больше нет на сервере.
+func reportOrphans(cfg *Config, listed map[string][]Repo) {
+	for _, name := range sortedKeys(listed) {
+		known := map[string]bool{}
+		for _, r := range listed[name] {
+			known[strings.ToLower(r.Path)] = true
+		}
+		base := filepath.Join(cfg.Repos(), name)
+		var orphans []string
+		for _, d := range findGitDirs(base) {
+			rel, err := filepath.Rel(base, d)
+			if err != nil {
+				continue
+			}
+			if rel = filepath.ToSlash(rel); !known[strings.ToLower(rel)] {
+				orphans = append(orphans, rel)
+			}
+		}
+		if len(orphans) > 0 {
+			log.Printf("%s: локально есть, но на сервере не найдено (не удаляю): %s",
+				name, strings.Join(orphans, ", "))
+		}
 	}
 	entries, err := os.ReadDir(cfg.Repos())
 	if err != nil {
 		return
 	}
-	var orphans []string
+	var stray []string
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || strings.HasPrefix(e.Name(), "__") {
-			continue
-		}
-		if !known[strings.ToLower(e.Name())] && isGitRepo(filepath.Join(cfg.Repos(), e.Name())) {
-			orphans = append(orphans, e.Name())
+		n := e.Name()
+		if e.IsDir() && !strings.HasPrefix(n, ".") && !strings.HasPrefix(n, "__") && cfg.source(n) == nil {
+			stray = append(stray, n)
 		}
 	}
-	if len(orphans) > 0 {
-		log.Printf("Локально есть, но на GitHub у %s не найдено (не удаляю): %s",
-			cfg.User, strings.Join(orphans, ", "))
+	if len(stray) > 0 {
+		log.Printf("Каталоги вне источников (не трогаю): %s", strings.Join(stray, ", "))
 	}
 }
 
